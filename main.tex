@@ -17,6 +17,7 @@
 \usepackage{titlesec}
 \usepackage{tcolorbox}
 \usepackage{mathtools}
+\usepackage{cancel}
 \usepackage{textcomp}
 
 % --- Page Style ---
@@ -4381,6 +4382,1739 @@ $$C_{\text{daily}} \approx 10^7 \times 500 \times 2 \times 150\text{B} = 1.5 \ti
 On H100 at 990 TFLOPS (50\% utilization): $\frac{1.5 \times 10^{21}}{990 \times 10^{12} \times 0.5 \times 86400} \approx 35$ H100s for decode alone.
 
 %% ============================================================
+\section{Multi-Token Prediction (MTP)}
+
+Multi-token prediction is one of the most impactful architectural innovations popularized by DeepSeek V3 and likely being evaluated by Anthropic. Instead of a single output head predicting the next token, the model employs $K$ parallel prediction heads, each predicting $K$ steps ahead simultaneously.
+
+\subsection{MTP Training Loss}
+
+$$\mathcal{L}_{\text{MTP}} = -\frac{1}{T} \sum_{t=1}^{T} \sum_{k=1}^{K} \lambda_k \log P_\theta(x_{t+k} \mid x_{<t})$$
+
+where $\lambda_k$ is a weight decay factor, typically $\lambda_k = \lambda^{k-1}$ with $\lambda \approx 0.3$. Later predictions receive exponentially less weight since they are inherently less accurate.
+
+\subsection{MTP Inference Speedup}
+
+During inference, all $K$ predictions are verified in a single pass against the main model:
+
+$$\text{Speedup}_{\text{MTP}} = \frac{K}{\sum_{k=1}^{K} (1 - \alpha_k)^0 \cdot \frac{1}{K}} \approx K \cdot \bar{\alpha}$$
+
+where $\bar{\alpha}$ is the average acceptance rate across heads.
+
+\subsection{MTP Architecture}
+
+\begin{lstlisting}[language=Python, caption={Multi-Token Prediction Head (Simplified)}]
+class MultiTokenPredictionHead(nn.Module):
+    def __init__(self, d_model, vocab_size, K=4):
+        super().__init__()
+        self.K = K
+        # K separate prediction heads
+        self.heads = nn.ModuleList([
+            nn.Linear(d_model, vocab_size) for _ in range(K)
+        ])
+        # Depth-wise transformers between heads
+        self.depth_layers = nn.ModuleList([
+            TransformerBlock(d_model) for _ in range(K - 1)
+        ])
+    
+    def forward(self, hidden_states):
+        predictions = []
+        h = hidden_states
+        for k in range(self.K):
+            logits_k = self.heads[k](h)
+            predictions.append(logits_k)
+            if k < self.K - 1:
+                h = self.depth_layers[k](h)
+        return predictions  # K sets of logits
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={MTP Inference: Verify All K Predictions in One Pass}]
+def mtp_generate(model, input_ids, K=4):
+    hidden, predictions = model(input_ids)
+    accepted = []
+    for k in range(K):
+        token = predictions[k].argmax(-1)[:, -1]  # greedy
+        # Verify against main model distribution
+        p_main = model.main_head(hidden)[:, -1, :]
+        if verify(token, p_main):
+            accepted.append(token)
+        else:
+            break
+    return accepted  # up to K tokens accepted
+\end{lstlisting}
+
+\subsection{Key Benefits}
+
+\begin{itemize}[itemsep=1pt]
+  \item \textbf{Training signal:} Forces the model to plan further ahead, improving representation quality
+  \item \textbf{Inference speedup:} $2\text{--}3\times$ with $K = 4$ and typical acceptance rates
+  \item \textbf{No quality loss:} Rejection sampling guarantees the output distribution matches the target model
+  \item \textbf{Synergy with speculative decoding:} MTP heads serve as a built-in draft model
+\end{itemize}
+
+%% ============================================================
+\section{Fast Mode --- Complete Internal Architecture}
+
+This section provides the definitive deep-dive into how Claude Opus 4.6's thinking system works internally, from API-level controls down to the model-level adaptive computation and serving-level optimizations.
+
+\subsection{Three Layers of Fast Mode}
+
+``Fast mode'' is not a single toggle --- it involves three distinct architectural layers working in concert:
+
+\begin{center}
+\begin{tabular}{lL{4cm}L{5cm}}
+\toprule
+\textbf{Layer} & \textbf{Fast Mode Mechanism} & \textbf{Formula / Effect} \\
+\midrule
+API level & \texttt{budget\_tokens} $\to$ 0 or omitted & No thinking tokens billed \\
+Model level & Early exit / adaptive compute & Halt when entropy threshold met \\
+Serving level & Speculative decoding + CUDA graphs & Wallclock speedup \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Entropy-Based Adaptive Thinking --- The Real Formula}
+
+The placeholder formula $T = f(C \times E)$ from Section 31 is a simplification. The real adaptive thinking model: the model halts thinking when its output distribution entropy drops below a threshold $\epsilon$:
+
+$$T_{\text{think}}^* = \arg\min_{t} \left[ H(P_\theta(\cdot \mid \text{context}, \text{think}_{1:t})) < \epsilon \right]$$
+
+where the entropy at step $t$ is:
+
+$$H_t = -\sum_{v \in V} P_\theta(v \mid \text{context}, \text{think}_{1:t}) \log P_\theta(v \mid \text{context}, \text{think}_{1:t})$$
+
+\textbf{Intuition:} When the model is ``confused'' about the answer, entropy is high and it keeps thinking. When it becomes confident (entropy drops), it stops thinking and begins generating the visible response.
+
+\textbf{Effort $\to$ entropy threshold mapping (speculative):}
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Effort} & \textbf{$\epsilon$ (halt)} & \textbf{Think Tokens} & \textbf{Behavior} & \textbf{Typical TTFT} \\
+\midrule
+\texttt{low} (fast) & 0.5 nat & 0--200 & Halt almost immediately & 0.3--1s \\
+\texttt{medium} & 0.3 nat & 200--3K & Moderate depth & 1--5s \\
+\texttt{high} (default) & 0.1 nat & 2K--30K & Deep selective reasoning & 3--20s \\
+\texttt{max} & 0.01 nat & 10K--128K & Exhaustive reasoning & 10--120s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Internal Thinking Pipeline --- Step by Step}
+
+\begin{tcolorbox}[colback=blue!3, colframe=blue!60!black, title={\bfseries How Thinking Works Internally (Speculative)}]
+\begin{lstlisting}[basicstyle=\ttfamily\small, frame=none, backgroundcolor=\color{blue!3}]
+1. REQUEST ARRIVES
+   Input: [system_prompt + user_message + history]
+   Effort level: determined by API param or auto-detected
+   
+2. COMPLEXITY ASSESSMENT (model-internal)
+   Model generates <thinking> start token
+   First 10-50 tokens: rapid problem decomposition
+   Internal classifier estimates: trivial / moderate / hard
+   
+3. ADAPTIVE COMPUTATION LOOP
+   while entropy(output_distribution) > epsilon:
+       generate next thinking token
+       if thinking_tokens > budget_tokens:
+           FORCE STOP thinking  # hard ceiling
+       if thinking_tokens > soft_limit:
+           increase pressure to conclude  # via biasing
+   
+4. COMPACTION CHECK (~5% of cases)
+   if thinking_tokens > compaction_threshold (~30K):
+       Summarize thinking-so-far into ~2K tokens
+       Continue thinking from summary (saves context)
+       # This is why thinking can exceed budget estimates
+   
+5. OUTPUT GENERATION
+   Generate </thinking> token
+   Begin visible response (uses thinking as context)
+   Thinking tokens are NOT shown to user (redacted)
+   
+6. BILLING
+   Thinking tokens billed at OUTPUT rate ($25/M)
+   Not at input rate --- this is a common mistake
+\end{lstlisting}
+\end{tcolorbox}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Thinking Compaction \& Summarization}
+
+When extended thinking exceeds $\sim$30K tokens, the model performs \textbf{compaction} --- summarizing its chain-of-thought to free context space:
+
+$$\text{think}_{\text{compacted}} = \text{Summarize}(\text{think}_{1:T}, \text{target\_length} \approx 2000)$$
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Property} & \textbf{Details} \\
+\midrule
+Trigger frequency & $\sim$5\% of requests (system card) \\
+Trigger threshold & $\sim$30K thinking tokens (speculated) \\
+Compacted length & $\sim$2K tokens summary \\
+Quality impact & Minimal on most tasks; can lose rare details \\
+Visible to user? & No --- all thinking is redacted \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Compaction formula (speculative):}
+
+$$C_{\text{think}} = \begin{cases}
+\text{think}_{1:T} & \text{if } T < T_{\text{compact}} \\
+\text{Summarize}(\text{think}_{1:T}) \oplus \text{think}_{T-k:T} & \text{if } T \geq T_{\text{compact}}
+\end{cases}$$
+
+where the last $k$ tokens of reasoning are preserved verbatim to maintain recency, and the rest is summarized.
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Early-Exit Transformer Layers (Speculative)}
+
+At the model architecture level, fast mode may leverage \textbf{early-exit mechanisms} where the model can produce an output after processing only a subset of its 160 layers:
+
+$$\hat{y}_l = \text{LM\_Head}_l(h^{(l)}) \quad \text{for } l \in \{L/4, L/2, 3L/4, L\}$$
+
+\textbf{Confidence-gated early exit:}
+
+$$\text{Exit at layer } l^* = \min_l \left\{ l : \max_v P_l(v \mid x) > \tau_{\text{conf}} \right\}$$
+
+where $\tau_{\text{conf}}$ is a confidence threshold. For simple queries (``What is 2+2?''), the model might exit after layer 40 instead of computing all 160 layers --- a $4\times$ speedup in prefill.
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Query Type} & \textbf{Exit Layer (est.)} & \textbf{FLOPs Saved} & \textbf{Example} \\
+\midrule
+Trivial factual & $\sim$40 / 160 & $\sim$75\% & ``Capital of France?'' \\
+Standard coding & $\sim$120 / 160 & $\sim$25\% & ``Write a Python sort'' \\
+Hard reasoning & 160 / 160 & 0\% & ``Prove $\sqrt{2}$ irrational'' \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Thinking Token Visibility \& Redaction Rules}
+
+\begin{tcolorbox}[colback=orange!5, colframe=orange!60!black, title={\bfseries Thinking Token Visibility Rules}]
+\begin{itemize}[itemsep=2pt]
+  \item \textbf{API responses:} Thinking blocks are \textbf{visible} (returned as \texttt{type: "thinking"} content blocks)
+  \item \textbf{claude.ai web interface:} Thinking is \textbf{visible} (expandable ``Thinking...'' section)
+  \item \textbf{Multi-turn persistence:} Previous thinking blocks are \textbf{redacted} from context --- replaced with a \texttt{[thinking redacted]} placeholder in subsequent turns
+  \item \textbf{Caching:} Thinking tokens are \textbf{not cacheable} --- they cannot be part of a cache prefix
+  \item \textbf{Streaming:} Thinking blocks stream as \texttt{thinking\_delta} events \textit{before} text content
+\end{itemize}
+\end{tcolorbox}
+
+$$T_{\text{context}}^{(\text{turn } n)} = T_{\text{system}} + \sum_{i=1}^{n-1}\left(T_{\text{user}}^{(i)} + \cancelto{\text{redacted}}{T_{\text{think}}^{(i)}} + T_{\text{output}}^{(i)}\right) + T_{\text{user}}^{(n)}$$
+
+This means thinking tokens are \textbf{paid for but discarded} between turns --- they do not consume context in subsequent turns.
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Latency Model for Each Effort Level}
+
+$$T_{\text{total}} = T_{\text{queue}} + T_{\text{prefill}} + T_{\text{think\_gen}} + T_{\text{output\_gen}} + T_{\text{network}}$$
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Component} & \textbf{Low (Fast)} & \textbf{Medium} & \textbf{High} & \textbf{Max} \\
+\midrule
+$T_{\text{queue}}$ & 50--200ms & 50--200ms & 50--200ms & 50--200ms \\
+$T_{\text{prefill}}$ (1K input) & $\sim$200ms & $\sim$200ms & $\sim$200ms & $\sim$200ms \\
+$T_{\text{think\_gen}}$ & 0--50ms & 100ms--1.5s & 1--15s & 5--60s \\
+$T_{\text{output\_gen}}$ (500 tok) & $\sim$8s & $\sim$8s & $\sim$8s & $\sim$8s \\
+\textbf{Total TTFT} & \textbf{0.3--0.5s} & \textbf{0.5--2s} & \textbf{1.5--15s} & \textbf{5--60s} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Key insight:} Fast mode's benefit is entirely in TTFT (Time to First Token). Once output generation begins, per-token latency is identical across all effort levels ($\sim$15--30ms/token).
+
+$$\text{TTFT}_{\text{fast}} = T_{\text{queue}} + T_{\text{prefill}} \approx 0.3\text{--}0.5\text{s}$$
+
+$$\text{TTFT}_{\text{max}} = T_{\text{queue}} + T_{\text{prefill}} + T_{\text{think}} \approx 5\text{--}60\text{s}$$
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Cost Comparison Across Effort Levels}
+
+For a typical 1,000-token input query with 500-token output:
+
+\begin{center}
+\begin{tabular}{llllll}
+\toprule
+\textbf{Effort} & \textbf{Input} & \textbf{Think} & \textbf{Output} & \textbf{Total Cost} & \textbf{Cost vs Fast} \\
+\midrule
+\texttt{low} (fast) & 1K & 0 & 500 & \$0.0175 & 1.0$\times$ \\
+\texttt{medium} & 1K & 1.5K & 500 & \$0.055 & 3.1$\times$ \\
+\texttt{high} & 1K & 10K & 500 & \$0.268 & 15.3$\times$ \\
+\texttt{max} & 1K & 50K & 500 & \$1.268 & 72.4$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$$\text{Cost} = \frac{T_{\text{in}} \times \$5 + (T_{\text{think}} + T_{\text{out}}) \times \$25}{10^6}$$
+
+\textbf{Critical:} The cost difference between fast and max can be \textbf{70$\times$} --- this is why routing matters.
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Quality vs Cost Tradeoff by Task Type}
+
+\begin{center}
+\begin{tabular}{L{3.5cm}llL{4cm}}
+\toprule
+\textbf{Task Category} & \textbf{Optimal Effort} & \textbf{Quality $\Delta$} & \textbf{Rationale} \\
+\midrule
+Classification & \texttt{low} & $<$1\% & Decision boundary already learned \\
+Extraction / NER & \texttt{low} & $<$2\% & Pattern matching, not reasoning \\
+Translation & \texttt{low--medium} & $\sim$3\% & Fluency improves slightly \\
+Simple Q\&A & \texttt{low} & $\sim$1\% & Factual recall, no reasoning \\
+Code generation & \texttt{high} & $\sim$15\% & Planning + debugging benefit \\
+Math proofs & \texttt{max} & $\sim$30\% & Step-by-step reasoning critical \\
+Complex analysis & \texttt{high--max} & $\sim$20\% & Multi-hop inference \\
+Agentic tasks & \texttt{high} & $\sim$25\% & Planning + error recovery \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Complete Fast Mode API Code}
+
+\begin{lstlisting}[language=Python, caption={Fast Mode: Zero Thinking Tokens}]
+import anthropic
+import time
+
+client = anthropic.Client()
+
+# == METHOD 1: Omit thinking entirely (true fast mode) ==
+def fast_mode_no_thinking(prompt: str) -> dict:
+    """
+    True fast mode: no thinking parameter at all.
+    Cheapest and fastest possible inference.
+    Use for: classification, extraction, simple Q&A.
+    """
+    t0 = time.perf_counter()
+    response = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=1024,
+        # No 'thinking' key at all
+        messages=[{"role": "user", "content": prompt}]
+    )
+    ttft = time.perf_counter() - t0
+    
+    return {
+        "text": response.content[0].text,
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "thinking_tokens": 0,
+        "cost": (response.usage.input_tokens * 5 + 
+                 response.usage.output_tokens * 25) / 1e6,
+        "ttft_s": ttft,
+        "mode": "fast_no_thinking"
+    }
+
+# == METHOD 2: Thinking enabled but budget_tokens = 1024
+#    (minimum allowed value) ==
+def fast_mode_minimal_thinking(prompt: str) -> dict:
+    """
+    Minimal thinking: model CAN think but strongly
+    discouraged from doing so. May use 0-200 tokens.
+    Slightly higher quality than no-thinking on edge cases.
+    """
+    t0 = time.perf_counter()
+    response = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=4096,
+        thinking={
+            "type": "enabled",
+            "budget_tokens": 1024  # minimum allowed
+        },
+        messages=[{"role": "user", "content": prompt}]
+    )
+    ttft = time.perf_counter() - t0
+    
+    think_tokens = 0
+    think_text = ""
+    response_text = ""
+    
+    for block in response.content:
+        if block.type == "thinking":
+            think_text = block.thinking
+            # Estimate thinking tokens from text
+            think_tokens = len(think_text.split()) * 1.3
+        elif block.type == "text":
+            response_text = block.text
+    
+    return {
+        "text": response_text,
+        "thinking": think_text,
+        "thinking_tokens_est": int(think_tokens),
+        "cost": (response.usage.input_tokens * 5 + 
+                 response.usage.output_tokens * 25) / 1e6,
+        "ttft_s": time.perf_counter() - t0,
+        "mode": "fast_minimal_thinking"
+    }
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={Adaptive Mode: Model Decides Thinking Depth}]
+def adaptive_mode_request(prompt: str, 
+                           budget: int = 10000) -> dict:
+    """
+    Adaptive mode: model uses as few thinking tokens as
+    needed. Budget is a CEILING, not a guarantee.
+    
+    For 'What is 2+2?' -> ~0 thinking tokens used.
+    For 'Prove P != NP' -> up to full budget.
+    """
+    t0 = time.perf_counter()
+    response = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=16384,
+        thinking={
+            "type": "enabled",
+            "budget_tokens": budget  # ceiling
+        },
+        messages=[{"role": "user", "content": prompt}]
+    )
+    ttft = time.perf_counter() - t0
+    
+    thinking_text = ""
+    response_text = ""
+    
+    for block in response.content:
+        if block.type == "thinking":
+            thinking_text = block.thinking
+        elif block.type == "text":
+            response_text = block.text
+    
+    return {
+        "text": response_text,
+        "thinking": thinking_text,
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "cost": (response.usage.input_tokens * 5 +
+                 response.usage.output_tokens * 25) / 1e6,
+        "ttft_s": ttft,
+        "mode": "adaptive"
+    }
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={Maximum Effort Mode: Exhaustive Reasoning}]
+def max_effort_request(prompt: str) -> dict:
+    """
+    Maximum effort: up to 128K thinking tokens.
+    Use for: math proofs, complex coding, research.
+    WARNING: Can cost $3+ per query and take 60+ seconds.
+    """
+    t0 = time.perf_counter()
+    response = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=16384,
+        thinking={
+            "type": "enabled",
+            "budget_tokens": 128000  # max possible
+        },
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    thinking_text = ""
+    response_text = ""
+    for block in response.content:
+        if block.type == "thinking":
+            thinking_text = block.thinking
+        elif block.type == "text":
+            response_text = block.text
+    
+    return {
+        "text": response_text,
+        "thinking": thinking_text,
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "cost": (response.usage.input_tokens * 5 +
+                 response.usage.output_tokens * 25) / 1e6,
+        "ttft_s": time.perf_counter() - t0,
+        "mode": "max_effort"
+    }
+\end{lstlisting}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Streaming Thinking Blocks}
+
+Thinking tokens stream \textit{before} the visible response. This allows UIs to show a ``Thinking...'' indicator:
+
+\begin{lstlisting}[language=Python, caption={Streaming with Thinking Blocks}]
+import anthropic
+
+client = anthropic.Client()
+
+def stream_with_thinking(prompt: str):
+    """
+    Stream response with real-time thinking visibility.
+    
+    Event order:
+    1. message_start
+    2. content_block_start (type=thinking)
+    3. thinking_delta events (thinking text streams)
+    4. content_block_stop (thinking block done)
+    5. content_block_start (type=text)
+    6. content_block_delta events (response streams)
+    7. content_block_stop
+    8. message_delta (final usage stats)
+    9. message_stop
+    """
+    thinking_total = ""
+    response_total = ""
+    current_block_type = None
+    
+    with client.messages.stream(
+        model="claude-opus-4-6-20260205",
+        max_tokens=16384,
+        thinking={
+            "type": "enabled",
+            "budget_tokens": 10000
+        },
+        messages=[{"role": "user", "content": prompt}]
+    ) as stream:
+        for event in stream:
+            if event.type == "content_block_start":
+                current_block_type = event.content_block.type
+                if current_block_type == "thinking":
+                    print("[THINKING] ", end="")
+                elif current_block_type == "text":
+                    print("\n[RESPONSE] ", end="")
+            
+            elif event.type == "content_block_delta":
+                if hasattr(event.delta, "thinking"):
+                    # Thinking text delta
+                    thinking_total += event.delta.thinking
+                    print(event.delta.thinking, end="",
+                          flush=True)
+                elif hasattr(event.delta, "text"):
+                    # Response text delta
+                    response_total += event.delta.text
+                    print(event.delta.text, end="",
+                          flush=True)
+            
+            elif event.type == "message_delta":
+                # Final usage statistics
+                print(f"\n--- Usage ---")
+                print(f"Output tokens: "
+                      f"{event.usage.output_tokens}")
+    
+    return thinking_total, response_total
+\end{lstlisting}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Multi-Turn Thinking Persistence}
+
+When using thinking across multiple conversation turns, previous thinking blocks are \textbf{redacted} from context:
+
+\begin{lstlisting}[language=Python, caption={Multi-Turn with Thinking: Redaction Behavior}]
+def multi_turn_with_thinking():
+    """
+    Demonstrate how thinking is handled across turns.
+    
+    KEY BEHAVIOR:
+    - Turn 1: Thinking is generated and returned
+    - Turn 2: Previous thinking is REPLACED with 
+      a [thinking redacted] placeholder
+    - Only current turn gets fresh thinking
+    - This saves context but loses reasoning chain
+    """
+    messages = []
+    
+    # -- Turn 1 --
+    messages.append({
+        "role": "user",
+        "content": "What is the integral of x^2?"
+    })
+    
+    response1 = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=8192,
+        thinking={"type": "enabled", 
+                  "budget_tokens": 5000},
+        messages=messages
+    )
+    
+    # Extract response content for next turn
+    # IMPORTANT: Include ALL content blocks (thinking + text)
+    assistant_content = []
+    for block in response1.content:
+        if block.type == "thinking":
+            # This will be REDACTED in turn 2's context
+            assistant_content.append({
+                "type": "thinking",
+                "thinking": block.thinking
+            })
+        elif block.type == "text":
+            assistant_content.append({
+                "type": "text",
+                "text": block.text
+            })
+    
+    messages.append({
+        "role": "assistant",
+        "content": assistant_content
+    })
+    
+    # -- Turn 2 --
+    messages.append({
+        "role": "user",
+        "content": "Now compute the definite integral "
+                   "from 0 to 3"
+    })
+    
+    # When this request is sent, the API internally 
+    # replaces Turn 1's thinking block with:
+    # {"type": "thinking", "thinking": "[redacted]"}
+    # This does NOT count toward input token billing
+    
+    response2 = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=8192,
+        thinking={"type": "enabled", 
+                  "budget_tokens": 5000},
+        messages=messages
+    )
+    
+    return response2
+\end{lstlisting}
+
+\textbf{Context accounting for multi-turn with thinking:}
+
+$$T_{\text{ctx}}^{(\text{turn } n)} = T_{\text{system}} + \sum_{i=1}^{n-1} (T_{\text{user}}^{(i)} + \underbrace{T_{\text{redacted}}}_{\approx 5 \text{ tokens}} + T_{\text{output}}^{(i)}) + T_{\text{user}}^{(n)} + T_{\text{think}}^{(n)}$$
+
+Previous thinking blocks consume only $\sim$5 tokens (the redaction placeholder), not their original length. This is a major context-saving mechanism.
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Production-Grade Fast Mode Router}
+
+\begin{lstlisting}[language=Python, caption={Production Fast Mode Router with Cost Tracking}]
+import anthropic
+import time
+import re
+from dataclasses import dataclass
+from enum import Enum
+
+class EffortLevel(Enum):
+    FAST = "fast"           # No thinking
+    LIGHT = "light"         # budget_tokens = 1024
+    MEDIUM = "medium"       # budget_tokens = 5000
+    DEEP = "deep"           # budget_tokens = 30000
+    MAX = "max"             # budget_tokens = 128000
+
+@dataclass
+class RoutingDecision:
+    effort: EffortLevel
+    budget_tokens: int
+    reason: str
+    estimated_cost: float
+
+EFFORT_CONFIG = {
+    EffortLevel.FAST:   {"budget": 0,      "max_out": 1024},
+    EffortLevel.LIGHT:  {"budget": 1024,   "max_out": 4096},
+    EffortLevel.MEDIUM: {"budget": 5000,   "max_out": 8192},
+    EffortLevel.DEEP:   {"budget": 30000,  "max_out": 16384},
+    EffortLevel.MAX:    {"budget": 128000, "max_out": 16384},
+}
+
+class FastModeRouter:
+    """
+    Production-grade router that selects optimal effort
+    level based on query characteristics.
+    
+    Saves 60-90% of costs vs always using 'high' effort.
+    """
+    
+    # Patterns that indicate simple queries
+    FAST_PATTERNS = [
+        r"^(what|who|when|where|which) (is|are|was|were)",
+        r"^define\s",
+        r"^translate\s",
+        r"^(yes|no)\s*\?",
+        r"^(true|false)\s*[\?\.]",
+        r"^(list|name|give me)\s",
+        r"^(convert|calculate)\s+\d",
+    ]
+    
+    # Patterns that indicate complex queries
+    DEEP_PATTERNS = [
+        r"(prove|proof|theorem|lemma)",
+        r"(debug|fix|error|bug|failing)",
+        r"(architect|design|system|refactor)",
+        r"(compare and contrast|analyze|evaluate)",
+        r"(step[\s-]by[\s-]step|explain why|reason)",
+        r"(implement|build|create).{20,}",
+    ]
+    
+    # Patterns for max effort
+    MAX_PATTERNS = [
+        r"(formal proof|mathematical proof)",
+        r"(security audit|vulnerability analysis)",
+        r"(research paper|novel approach)",
+    ]
+    
+    def classify(self, prompt: str, 
+                 system_prompt: str = "") -> RoutingDecision:
+        """Classify query into effort level."""
+        text = prompt.lower().strip()
+        word_count = len(prompt.split())
+        total_input = len(prompt) + len(system_prompt)
+        
+        # Rule 1: Very short = fast
+        if word_count < 10:
+            return RoutingDecision(
+                effort=EffortLevel.FAST,
+                budget_tokens=0,
+                reason=f"Short query ({word_count} words)",
+                estimated_cost=self._est_cost(
+                    total_input, 0, 200)
+            )
+        
+        # Rule 2: Pattern matching
+        for pattern in self.MAX_PATTERNS:
+            if re.search(pattern, text):
+                return RoutingDecision(
+                    effort=EffortLevel.MAX,
+                    budget_tokens=128000,
+                    reason=f"Matched MAX pattern: {pattern}",
+                    estimated_cost=self._est_cost(
+                        total_input, 50000, 2000)
+                )
+        
+        for pattern in self.DEEP_PATTERNS:
+            if re.search(pattern, text):
+                return RoutingDecision(
+                    effort=EffortLevel.DEEP,
+                    budget_tokens=30000,
+                    reason=f"Matched DEEP pattern: {pattern}",
+                    estimated_cost=self._est_cost(
+                        total_input, 15000, 1000)
+                )
+        
+        for pattern in self.FAST_PATTERNS:
+            if re.search(pattern, text):
+                return RoutingDecision(
+                    effort=EffortLevel.FAST,
+                    budget_tokens=0,
+                    reason=f"Matched FAST pattern: {pattern}",
+                    estimated_cost=self._est_cost(
+                        total_input, 0, 300)
+                )
+        
+        # Rule 3: Length-based heuristic
+        if word_count < 25:
+            return RoutingDecision(
+                effort=EffortLevel.LIGHT,
+                budget_tokens=1024,
+                reason="Medium-short query, light thinking",
+                estimated_cost=self._est_cost(
+                    total_input, 500, 500)
+            )
+        elif word_count < 100:
+            return RoutingDecision(
+                effort=EffortLevel.MEDIUM,
+                budget_tokens=5000,
+                reason="Medium-length query",
+                estimated_cost=self._est_cost(
+                    total_input, 2000, 800)
+            )
+        else:
+            return RoutingDecision(
+                effort=EffortLevel.DEEP,
+                budget_tokens=30000,
+                reason="Long/complex query",
+                estimated_cost=self._est_cost(
+                    total_input, 10000, 1500)
+            )
+    
+    def _est_cost(self, input_tok, think_tok, 
+                  output_tok) -> float:
+        """Estimate cost in USD."""
+        return (input_tok * 5 + 
+                (think_tok + output_tok) * 25) / 1e6
+    
+    def route_and_execute(self, prompt: str, 
+                          system: str = "") -> dict:
+        """Classify, route, and execute the request."""
+        decision = self.classify(prompt, system)
+        config = EFFORT_CONFIG[decision.effort]
+        
+        kwargs = {
+            "model": "claude-opus-4-6-20260205",
+            "max_tokens": config["max_out"],
+            "messages": [{"role": "user", 
+                          "content": prompt}]
+        }
+        
+        if system:
+            kwargs["system"] = system
+        
+        # Only add thinking if budget > 0
+        if config["budget"] > 0:
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": config["budget"]
+            }
+        
+        t0 = time.perf_counter()
+        response = client.messages.create(**kwargs)
+        latency = time.perf_counter() - t0
+        
+        # Extract content
+        thinking = ""
+        text = ""
+        for block in response.content:
+            if block.type == "thinking":
+                thinking = block.thinking
+            elif block.type == "text":
+                text = block.text
+        
+        actual_cost = (
+            response.usage.input_tokens * 5 +
+            response.usage.output_tokens * 25
+        ) / 1e6
+        
+        return {
+            "text": text,
+            "thinking": thinking,
+            "effort": decision.effort.value,
+            "reason": decision.reason,
+            "estimated_cost": decision.estimated_cost,
+            "actual_cost": actual_cost,
+            "latency_s": latency,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        }
+\end{lstlisting}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Effort Level Comparison Benchmark}
+
+\begin{lstlisting}[language=Python, caption={Benchmark: Compare All Effort Levels}]
+def benchmark_effort_levels(prompts: list[str]):
+    """
+    Run the same prompts at every effort level.
+    Measure: quality, cost, latency, thinking tokens.
+    """
+    results = []
+    router = FastModeRouter()
+    
+    for prompt in prompts:
+        for effort in EffortLevel:
+            config = EFFORT_CONFIG[effort]
+            kwargs = {
+                "model": "claude-opus-4-6-20260205",
+                "max_tokens": config["max_out"],
+                "messages": [{"role": "user", 
+                              "content": prompt}]
+            }
+            if config["budget"] > 0:
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": config["budget"]
+                }
+            
+            t0 = time.perf_counter()
+            resp = client.messages.create(**kwargs)
+            latency = time.perf_counter() - t0
+            
+            thinking_text = ""
+            response_text = ""
+            for block in resp.content:
+                if block.type == "thinking":
+                    thinking_text = block.thinking
+                elif block.type == "text":
+                    response_text = block.text
+            
+            cost = (resp.usage.input_tokens * 5 +
+                    resp.usage.output_tokens * 25) / 1e6
+            
+            results.append({
+                "prompt": prompt[:50],
+                "effort": effort.value,
+                "latency_s": round(latency, 2),
+                "cost_usd": round(cost, 4),
+                "think_len": len(thinking_text),
+                "response_len": len(response_text),
+                "output_tokens": resp.usage.output_tokens,
+            })
+    
+    # Print comparison table
+    print(f"{'Effort':<10} {'Latency':>8} {'Cost':>8} "
+          f"{'Think':>7} {'Response':>8}")
+    print("-" * 50)
+    for r in results:
+        print(f"{r['effort']:<10} {r['latency_s']:>7.2f}s "
+              f"${r['cost_usd']:>7.4f} "
+              f"{r['think_len']:>6}c "
+              f"{r['response_len']:>7}c")
+    
+    return results
+\end{lstlisting}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Fast Mode with Tool Use}
+
+When combining fast mode with tool calls, thinking can optionally wrap the tool-use planning:
+
+\begin{lstlisting}[language=Python, caption={Fast Mode with Tools: No Thinking Overhead}]
+def fast_tool_call(prompt: str, tools: list):
+    """
+    Fast mode with tool use: the model skips thinking
+    and goes directly to selecting/calling tools.
+    
+    This is optimal for:
+    - Simple data retrieval (search, lookup)
+    - Stateless operations (calculate, convert)
+    - Classification into tool choices
+    """
+    response = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=1024,
+        # No thinking parameter = fast mode
+        tools=tools,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    tool_calls = []
+    text_parts = []
+    
+    for block in response.content:
+        if block.type == "tool_use":
+            tool_calls.append({
+                "id": block.id,
+                "name": block.name,
+                "input": block.input
+            })
+        elif block.type == "text":
+            text_parts.append(block.text)
+    
+    return {
+        "tool_calls": tool_calls,
+        "text": " ".join(text_parts),
+        "cost": (response.usage.input_tokens * 5 +
+                 response.usage.output_tokens * 25) / 1e6
+    }
+
+def deep_tool_call(prompt: str, tools: list):
+    """
+    Deep mode with tools: thinking helps the model 
+    PLAN which tools to call and in what order.
+    
+    Use for:
+    - Multi-step tool chains
+    - Ambiguous tool selection
+    - Error recovery in agentic loops
+    """
+    response = client.messages.create(
+        model="claude-opus-4-6-20260205",
+        max_tokens=8192,
+        thinking={
+            "type": "enabled",
+            "budget_tokens": 10000
+        },
+        tools=tools,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    # Thinking block will contain tool planning:
+    # "I need to first search the database for X,
+    #  then use the calculator on the result..."
+    
+    thinking = ""
+    tool_calls = []
+    text_parts = []
+    
+    for block in response.content:
+        if block.type == "thinking":
+            thinking = block.thinking
+        elif block.type == "tool_use":
+            tool_calls.append({
+                "id": block.id,
+                "name": block.name,
+                "input": block.input
+            })
+        elif block.type == "text":
+            text_parts.append(block.text)
+    
+    return {
+        "thinking": thinking,
+        "tool_calls": tool_calls,
+        "text": " ".join(text_parts),
+    }
+\end{lstlisting}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Thinking Budget Constraints \& Edge Cases}
+
+\begin{center}
+\begin{tabular}{L{4cm}L{10cm}}
+\toprule
+\textbf{Constraint} & \textbf{Details} \\
+\midrule
+Minimum budget & 1,024 tokens (if thinking is enabled at all) \\
+Maximum budget & 128,000 tokens \\
+Budget = ceiling & Model may use \textit{far fewer} tokens than budgeted \\
+No partial thinking & Model always completes a coherent thought before halting \\
+Compaction trigger & $\sim$30K tokens $\to$ summarize and continue \\
+Context interaction & $T_{\text{think}} + T_{\text{output}} \leq T_{\text{max\_output}}$ \\
+Budget vs max\_tokens & \texttt{budget\_tokens} must be $<$ \texttt{max\_tokens} \\
+Thinking + caching & Thinking blocks \textbf{cannot} be part of cached prefixes \\
+Thinking + streaming & Thinking deltas arrive \textit{before} text deltas \\
+Thinking + tools & Thinking wraps tool planning; tool results trigger new thinking \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{When to Use Each Mode --- Decision Tree}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small, caption={Fast Mode Decision Tree}]
+                    Is the task simple?
+                   /                  \
+                 YES                   NO
+                  |                     |
+            Is latency critical?    Does accuracy matter?
+           /        \              /            \
+         YES         NO          YES             NO
+          |           |           |               |
+       FAST        FAST      Is it math/proof?  MEDIUM
+    (no think)  (no think)   /          \
+                           YES           NO
+                            |             |
+                          MAX          HIGH
+                    (budget=128K)  (budget=30K)
+\end{lstlisting}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Serving-Level Fast Mode Optimizations}
+
+Beyond the model itself, Anthropic's serving infrastructure applies several optimizations that specifically benefit fast mode:
+
+\begin{center}
+\begin{tabular}{lL{4cm}L{5cm}}
+\toprule
+\textbf{Optimization} & \textbf{How It Helps Fast Mode} & \textbf{Estimated Impact} \\
+\midrule
+\textbf{CUDA Graphs} & Eliminate Python overhead per decode step & 10--20$\times$ for batch=1 \\
+\textbf{Speculative decoding} & Draft model generates 4--8 tokens at once & 2--3$\times$ tokens/sec \\
+\textbf{KV cache reuse} & Skip recomputing cached system prompts & 90\% input cost reduction \\
+\textbf{Continuous batching} & Fill empty GPU cycles with fast-mode requests & 2--4$\times$ throughput \\
+\textbf{Priority queuing} & Fast-mode requests get lower queue latency & $\sim$50\% lower TTFT \\
+\textbf{Prefix sharing} & Multiple fast requests share KV cache & TB-scale memory savings \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Combined effect:} Fast mode requests are not just cheaper (no thinking tokens) but also \textit{physically faster} on the GPUs because they can be batched more efficiently and use CUDA graph replay.
+
+$$\text{Throughput}_{\text{fast}} \approx 3\text{--}5 \times \text{Throughput}_{\text{max}}$$
+
+This is because fast-mode requests have no variable-length thinking phase, making them ideal for continuous batching and GPU utilization optimization.
+
+
+
+%% ============================================================
+\section{EAGLE / EAGLE-2 Speculative Decoding}
+
+Your Section 47 covers basic speculative decoding but misses the state-of-the-art variant. EAGLE's key insight: the draft model operates on \textbf{hidden states} (feature level), not just tokens, giving much higher acceptance rates.
+
+\subsection{EAGLE vs Standard Speculative Decoding}
+
+\textbf{EAGLE:}
+$$h_{t+1}^{\text{draft}} = \text{EAGLE}(h_t^{\text{target}}, x_t)$$
+
+\textbf{Standard speculative decoding:}
+$$x_{t+1}^{\text{draft}} = \text{SmallLM}(x_{1:t})$$
+
+\subsection{Acceptance Rate Comparison}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Method} & \textbf{$\bar{\alpha}$ (Acceptance Rate)} & \textbf{Speedup} \\
+\midrule
+Standard speculative & $\sim$0.65 & $\sim$1.8$\times$ \\
+EAGLE & $\sim$0.80 & $\sim$2.5$\times$ \\
+EAGLE-2 (dynamic draft length) & $\sim$0.85 & $\sim$3.0$\times$ \\
+MTP ($K = 4$) & $\sim$0.75 & $\sim$2.8$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{EAGLE Draft Model Architecture}
+
+\begin{lstlisting}[language=Python, caption={EAGLE Draft Model: Predicts Next Hidden State}]
+class EAGLEDraftModel(nn.Module):
+    """
+    EAGLE draft model: predicts next hidden state from 
+    (current hidden state + current token embedding).
+    Runs ~10x cheaper than the full target model.
+    """
+    def __init__(self, d_model: int, n_layers: int = 1):
+        super().__init__()
+        self.fc = nn.Linear(d_model * 2, d_model)
+        self.decoder_layers = nn.ModuleList([
+            TransformerBlock(d_model) for _ in range(n_layers)
+        ])
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+    
+    def forward(self, hidden_state, token_embed):
+        # Concatenate hidden state with token embedding
+        x = torch.cat([hidden_state, token_embed], dim=-1)
+        x = self.fc(x)
+        for layer in self.decoder_layers:
+            x = layer(x)
+        return self.lm_head(x)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={EAGLE Speculative Decoding Loop}]
+def eagle_generate(target_model, draft_model, 
+                   input_ids, K=6, max_new_tokens=200):
+    """EAGLE speculative decoding loop."""
+    generated = input_ids.clone()
+    
+    while len(generated[0]) - len(input_ids[0]) < max_new_tokens:
+        # 1. Get target model hidden state
+        with torch.no_grad():
+            target_out = target_model(generated, 
+                                       output_hidden_states=True)
+            h_current = target_out.hidden_states[-1][:, -1, :]
+        
+        # 2. Draft K tokens using EAGLE
+        draft_tokens = []
+        h = h_current
+        x = generated
+        
+        for _ in range(K):
+            token_embed = target_model.embed_tokens(x[:, -1:])
+            logits = draft_model(h, token_embed.squeeze(1))
+            next_token = logits.argmax(-1)
+            draft_tokens.append(next_token)
+            h = draft_model.fc(
+                torch.cat([h, token_embed.squeeze(1)], -1))
+            x = torch.cat([x, next_token.unsqueeze(1)], dim=1)
+        
+        # 3. Verify all K draft tokens in ONE target pass
+        candidate_seq = torch.cat(
+            [generated, torch.stack(draft_tokens, dim=1)], dim=1
+        )
+        with torch.no_grad():
+            verify_logits = target_model(candidate_seq).logits
+        
+        # 4. Accept/reject via rejection sampling
+        n_accepted = 0
+        for i, draft_tok in enumerate(draft_tokens):
+            pos = len(generated[0]) + i - 1
+            p_target = F.softmax(
+                verify_logits[:, pos, :], dim=-1)
+            accept_prob = min(1.0, 
+                p_target[0, draft_tok].item())
+            if torch.rand(1) < accept_prob:
+                n_accepted += 1
+            else:
+                break
+        
+        # Accept n_accepted tokens + 1 resampled
+        accepted = draft_tokens[:n_accepted]
+        bonus = verify_logits[
+            :, len(generated[0]) + n_accepted - 1, :
+        ].argmax(-1)
+        
+        generated = torch.cat([
+            generated,
+            torch.stack(accepted + [bonus], dim=1)
+        ], dim=1)
+    
+    return generated
+\end{lstlisting}
+
+\subsection{EAGLE-2: Dynamic Draft Length}
+
+EAGLE-2 improves upon EAGLE by \textbf{dynamically adjusting} the draft length $K$ based on the current acceptance rate:
+\begin{itemize}[itemsep=1pt]
+  \item High acceptance rate $\to$ increase $K$ (draft more aggressively)
+  \item Low acceptance rate $\to$ decrease $K$ (avoid wasted compute)
+  \item Builds a \textbf{token tree} instead of a linear chain, exploring multiple branches
+\end{itemize}
+
+%% ============================================================
+\section{Medusa Decoding}
+
+Medusa takes a different approach from draft-model-based speculative decoding: it attaches \textbf{multiple lightweight prediction heads} directly to the base LLM, each predicting $K$ steps ahead in parallel.
+
+\subsection{Medusa Head Architecture}
+
+$$\text{Medusa heads}: \{f_k(h_t)\}_{k=1}^{K}$$
+
+\begin{lstlisting}[language=Python, caption={Medusa: K Parallel Prediction Heads}]
+class MedusaHeads(nn.Module):
+    """
+    K parallel prediction heads added to the base LLM.
+    Each head_k predicts the token at position t+k.
+    """
+    def __init__(self, d_model: int, vocab_size: int, 
+                 K: int = 5, n_hidden: int = 1):
+        super().__init__()
+        self.K = K
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                *[ResidualBlock(d_model) 
+                  for _ in range(n_hidden)],
+                nn.Linear(d_model, vocab_size, bias=False)
+            )
+            for _ in range(K)
+        ])
+    
+    def forward(self, hidden_states):
+        # hidden_states: [batch, seq_len, d_model]
+        return [head(hidden_states) for head in self.heads]
+\end{lstlisting}
+
+\subsection{Tree-Based Verification (Medusa's Key Innovation)}
+
+Instead of verifying a linear $K$-token draft, Medusa builds a \textbf{token tree}: each position has top-$s$ candidates, yielding $s^K$ leaf nodes verified in a single forward pass.
+
+\begin{lstlisting}[language=Python, caption={Medusa Tree Verification}]
+def medusa_tree_verify(base_logits, medusa_logits, 
+                       tree_candidates):
+    """
+    Tree with K=4, s=3: 3^4 = 81 candidates at once.
+    Verify the entire tree in one forward pass.
+    Acceptance: pick the longest prefix that passes.
+    """
+    best_path = []
+    for depth, (candidates, logits) in enumerate(
+        zip(tree_candidates, medusa_logits)
+    ):
+        p_base = F.softmax(base_logits[:, depth, :], dim=-1)
+        accepted_at_depth = []
+        for candidate_token in candidates:
+            if (p_base[0, candidate_token] > 
+                1.0 / logits.shape[-1]):
+                accepted_at_depth.append(candidate_token)
+        if not accepted_at_depth:
+            break
+        best_path.append(accepted_at_depth[0])
+    
+    return best_path
+\end{lstlisting}
+
+\subsection{Medusa vs EAGLE}
+
+\begin{center}
+\begin{tabular}{lL{5cm}L{5cm}}
+\toprule
+& \textbf{Medusa} & \textbf{EAGLE} \\
+\midrule
+\textbf{Draft model} & No separate model; heads added to base & Lightweight draft model on hidden states \\
+\textbf{Training cost} & Low (only heads fine-tuned) & Moderate (train small draft model) \\
+\textbf{Acceptance rate} & $\sim$0.70--0.80 & $\sim$0.80--0.85 \\
+\textbf{Verification} & Tree-based (exponential candidates) & Linear or tree \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{Lookahead Decoding (Jacobi Iteration)}
+
+Lookahead decoding requires \textbf{no separate draft model}. It uses Jacobi iterations on a fixed-size ``window'' of future tokens, converging to the correct output through parallel self-consistency.
+
+\subsection{Jacobi Iteration Formula}
+
+At iteration $r$, maintain a window $W = [w_1, w_2, \ldots, w_N]$ of candidate future tokens:
+
+$$w_i^{(r+1)} = \arg\max P_\theta(x_{t+i} \mid x_{<t}, w_1^{(r)}, \ldots, w_{i-1}^{(r)})$$
+
+Converged positions are accepted; the window shifts forward.
+
+\subsection{Two Parallel Streams}
+
+\begin{enumerate}[itemsep=1pt]
+  \item \textbf{Lookahead branch:} Jacobi iterations generate $n$-grams in parallel
+  \item \textbf{Verification branch:} Verify candidate $n$-grams against the model
+\end{enumerate}
+
+\begin{lstlisting}[language=Python, caption={Lookahead Decoding: No Draft Model Needed}]
+def lookahead_decode(model, input_ids, 
+                     window_size: int = 5,
+                     n_gram_size: int = 5,
+                     max_new_tokens: int = 200):
+    """
+    Lookahead decoding: no separate draft model needed.
+    Uses Jacobi iterations for parallel token generation.
+    """
+    generated = input_ids.clone()
+    ngram_pool = {}  # Cache of verified n-grams
+    
+    def update_ngram_pool(tokens):
+        """Store n-grams from accepted sequences."""
+        for i in range(len(tokens) - n_gram_size + 1):
+            key = tuple(tokens[i:i+n_gram_size-1].tolist())
+            value = tokens[i + n_gram_size - 1]
+            ngram_pool[key] = value
+    
+    while len(generated[0]) - len(input_ids[0]) < max_new_tokens:
+        # -- Lookahead: W parallel Jacobi steps --
+        window = torch.randint(
+            0, model.config.vocab_size, 
+            (1, window_size), device=input_ids.device
+        )
+        
+        for _ in range(window_size):
+            full_seq = torch.cat([generated, window], dim=1)
+            with torch.no_grad():
+                logits = model(full_seq).logits
+            window = logits[
+                :, len(generated[0])-1:-1, :
+            ].argmax(-1)
+        
+        # -- Verification: Check n-grams --
+        current_key = tuple(
+            generated[0, -n_gram_size+1:].tolist())
+        
+        if current_key in ngram_pool:
+            candidate = ngram_pool[current_key]
+            candidate_seq = torch.cat([
+                generated, 
+                torch.tensor([[candidate]], 
+                             device=input_ids.device)
+            ], dim=1)
+        else:
+            candidate_seq = torch.cat(
+                [generated, window[:, :1]], dim=1)
+        
+        with torch.no_grad():
+            verify_logits = model(candidate_seq).logits
+        
+        p = F.softmax(verify_logits[
+            :, len(generated[0])-1, :], dim=-1)
+        candidate_token = candidate_seq[:, len(generated[0])]
+        
+        if p[0, candidate_token] > 0.1:
+            generated = candidate_seq
+            update_ngram_pool(generated[0, -n_gram_size:])
+        else:
+            next_token = p.multinomial(1)
+            generated = torch.cat(
+                [generated, next_token], dim=1)
+    
+    return generated
+\end{lstlisting}
+
+\subsection{Advantages of Lookahead}
+
+\begin{itemize}[itemsep=1pt]
+  \item \textbf{No draft model needed:} Zero additional training or memory
+  \item \textbf{Model-agnostic:} Works with any autoregressive model
+  \item \textbf{N-gram caching:} Verified $n$-grams accelerate future iterations
+  \item \textbf{Typical speedup:} $\sim$1.5--2.0$\times$ (lower than EAGLE but simpler)
+\end{itemize}
+
+%% ============================================================
+\section{Disaggregated Prefill-Decode Serving}
+
+A major infrastructure optimization completely absent from the earlier sections. Separating prefill (compute-bound) from decode (memory-bound) onto specialized hardware dramatically improves throughput.
+
+\subsection{Why Disaggregate?}
+
+The prefill phase (processing the input prompt) and decode phase (generating output tokens) have fundamentally different hardware requirements:
+
+\begin{center}
+\begin{tabular}{lL{5cm}L{5cm}}
+\toprule
+& \textbf{Prefill} & \textbf{Decode} \\
+\midrule
+\textbf{Dominant op} & GEMM (matrix-matrix) & GEMV (matrix-vector) \\
+\textbf{Bottleneck} & Compute-bound & Memory-bandwidth-bound \\
+\textbf{GPU utilization} & 85\%+ & 5--15\% \\
+\textbf{Ideal hardware} & H100 (high FLOPs) & H200/A100 HBM (high BW) \\
+\textbf{Batch size} & Large (many prompts at once) & Small (one token per request) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Optimal GPU Split Formula}
+
+$$\text{GPU}_{\text{prefill}}^* = \arg\min_n \left[\frac{C_{\text{prefill}}}{n \cdot F_{\text{compute}}}\right]$$
+
+$$\text{GPU}_{\text{decode}}^* = \arg\min_m \left[\frac{M_{\text{KV}}}{m \cdot BW_{\text{memory}}}\right]$$
+
+\subsection{Architecture Overview}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small, caption={Disaggregated Serving Architecture}]
++-------------------------------------------------+
+|  REQUEST ROUTER                                 |
+|  Route: new request -> prefill node             |
+|         token generation -> decode node         |
++-----------+-------------------------------------+
+            |
+  +---------v----------+  +----------------------+
+  |  PREFILL CLUSTER   |  |  DECODE CLUSTER      |
+  |  (H100, compute)   +->|  (H200 / A100 HBM)  |
+  |                    |  |                      |
+  |  * High batch size |  |  * Small batches     |
+  |  * GEMM heavy      |  |  * GEMV heavy        |
+  |  * FP8 matmuls     |  |  * KV cache hot      |
+  |                    |  |                      |
+  |  Output: KV cache  |  |  Input: KV cache     |
+  |  (via NVLink)      |  |  (streamed in)       |
+  +--------------------+  +----------------------+
+\end{lstlisting}
+
+\subsection{KV Cache Transfer Cost}
+
+$$T_{\text{transfer}} = \frac{M_{\text{KV}}}{BW_{\text{network}}} = \frac{1.25\text{ TB (for 1M ctx)}}{400\text{ GB/s (NVLink)}} \approx 3.1\text{ seconds}$$
+
+This transfer latency is the primary bottleneck for very long contexts. For shorter contexts ($\sim$10K tokens), transfer takes $\sim$30ms.
+
+\subsection{Conceptual Implementation}
+
+\begin{lstlisting}[language=Python, caption={Disaggregated Serving Engine}]
+class DisaggregatedServingEngine:
+    def __init__(self, prefill_workers, decode_workers):
+        self.prefill_pool = prefill_workers
+        self.decode_pool = decode_workers
+        self.kv_transfer_bw = 400e9  # 400 GB/s NVLink
+    
+    async def generate(self, request):
+        # Phase 1: Prefill on compute-optimized node
+        prefill_node = self.select_prefill_node()
+        kv_cache, first_token = await prefill_node.prefill(
+            input_ids=request.input_ids,
+            model_weights=self.shared_weights
+        )
+        
+        # Phase 2: Transfer KV cache to decode node
+        kv_size_gb = self.estimate_kv_size(
+            len(request.input_ids[0])
+        )
+        transfer_time = kv_size_gb / (
+            self.kv_transfer_bw / 1e9)
+        
+        decode_node = self.select_decode_node()
+        await decode_node.load_kv_cache(kv_cache)
+        
+        # Phase 3: Decode on memory-BW-optimized node
+        yield first_token
+        async for token in decode_node.generate_tokens(
+            kv_cache=kv_cache,
+            max_new_tokens=request.max_tokens
+        ):
+            yield token
+    
+    def estimate_kv_size(self, seq_len: int) -> float:
+        """KV cache size in GB for given sequence length."""
+        L, nkv, dh = 160, 16, 128
+        return (2 * L * nkv * dh * seq_len * 2) / 1e9
+\end{lstlisting}
+
+%% ============================================================
+\section{CUDA Graph Capture}
+
+A major inference optimization that eliminates Python/CUDA overhead per decode step.
+
+\subsection{The Problem}
+
+Python/CUDA kernel launch overhead is significant at small batch sizes: $\sim$1--5ms per token. For decode (which is already memory-bound), this overhead can dominate.
+
+\subsection{Solution: Graph Capture}
+
+CUDA graphs capture the entire decode step as a \textbf{static computation graph}, replaying it with zero Python overhead:
+
+\begin{lstlisting}[language=Python, caption={CUDA Graph Optimized Decoder}]
+class CUDAGraphOptimizedDecoder:
+    """
+    Capture the decode step as a CUDA graph.
+    Eliminates Python overhead: ~1-5ms -> ~0.1ms per step.
+    Only works for fixed-shape operations (decode, not
+    prefill).
+    """
+    def __init__(self, model, batch_size, d_model):
+        self.model = model
+        self.batch_size = batch_size
+        self.graph = None
+        
+        # Static buffers (required for CUDA graphs)
+        self.static_input_ids = torch.zeros(
+            batch_size, 1, dtype=torch.long, device="cuda"
+        )
+        self.static_kv_cache = self._allocate_kv_cache()
+        self.static_output = torch.zeros(
+            batch_size, 1, model.config.vocab_size,
+            device="cuda"
+        )
+    
+    def capture(self):
+        """One-time capture of the decode graph."""
+        # Warmup (required before capture)
+        for _ in range(3):
+            self._decode_step()
+        
+        # Capture
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.static_output = self._decode_step()
+        
+        print(f"CUDA graph captured. "
+              f"Expected speedup: ~10-20x small batches")
+    
+    def _decode_step(self):
+        """Single autoregressive decode step."""
+        return self.model(
+            input_ids=self.static_input_ids,
+            past_key_values=self.static_kv_cache,
+            use_cache=True
+        ).logits
+    
+    def generate_token(self, input_id):
+        """Generate one token using captured graph."""
+        assert self.graph is not None, "Call capture() first"
+        # Copy new input into static buffer (in-place)
+        self.static_input_ids.copy_(input_id)
+        # Replay captured graph (zero Python overhead)
+        self.graph.replay()
+        # Sample from output
+        return self.static_output[:, -1, :].argmax(-1)
+\end{lstlisting}
+
+\subsection{Benchmark: Graph vs Eager}
+
+\begin{lstlisting}[language=Python, caption={CUDA Graph Benchmark}]
+def benchmark(decoder, n_tokens: int = 100):
+    """Compare graph vs non-graph performance."""
+    dummy = torch.zeros(decoder.batch_size, 1, 
+                        dtype=torch.long, device="cuda")
+    
+    # Without graph
+    t0 = time.perf_counter()
+    for _ in range(n_tokens):
+        _ = decoder._decode_step()
+    torch.cuda.synchronize()
+    t_eager = time.perf_counter() - t0
+    
+    # With graph
+    decoder.capture()
+    t0 = time.perf_counter()
+    for _ in range(n_tokens):
+        decoder.static_input_ids.copy_(dummy)
+        decoder.graph.replay()
+    torch.cuda.synchronize()
+    t_graph = time.perf_counter() - t0
+    
+    print(f"Eager: {t_eager*1000:.1f}ms | "
+          f"Graph: {t_graph*1000:.1f}ms | "
+          f"Speedup: {t_eager/t_graph:.2f}x")
+\end{lstlisting}
+
+\subsection{Constraints}
+
+\begin{itemize}[itemsep=1pt]
+  \item \textbf{Fixed shapes only:} Input/output tensor shapes must be constant (decode is fixed; prefill is variable)
+  \item \textbf{No dynamic control flow:} All branching must be static
+  \item \textbf{Static KV cache pointers:} KV cache must use pre-allocated buffers
+  \item \textbf{Most effective at:} Small batch sizes (batch = 1--8) where overhead dominates
+\end{itemize}
+
+%% ============================================================
+\section{Token Healing}
+
+A practical fix for tokenization boundary artifacts that affect code generation quality.
+
+\subsection{The Problem}
+
+If the model generates the partial token \texttt{pr} and the next token should be \texttt{int}, BPE might have trained on \texttt{print} as a single token --- so generating \texttt{int} as a standalone token is suboptimal and can produce lower-quality continuations.
+
+\subsection{Token Healing Formula}
+
+$$x_{\text{healed}} = \arg\max_{t} P_\theta(t \mid x_{<n-k})$$
+
+where $k$ = length of the ``boundary'' tokens to re-generate. The model backtracks $k$ tokens and re-generates from the most recent clean boundary.
+
+\subsection{Implementation}
+
+\begin{lstlisting}[language=Python, caption={Token Healing Implementation}]
+def token_healing(model, tokenizer, prompt: str) -> str:
+    """
+    Fix tokenization boundary artifacts.
+    Re-generate the last 1-2 tokens of the prompt to
+    find the highest-probability continuation.
+    
+    Example:
+      prompt = "def cal"
+      Without: continues from "cal" (bad boundary)
+      With:    back up to "def ", regenerate -> "calculate"
+    """
+    tokens = tokenizer.encode(prompt)
+    
+    if len(tokens) < 2:
+        return prompt
+    
+    # Roll back 1 token
+    rollback_len = 1
+    prefix_tokens = tokens[:-rollback_len]
+    prefix_text = tokenizer.decode(prefix_tokens)
+    
+    # Re-generate from prefix
+    with torch.no_grad():
+        logits = model(
+            torch.tensor([prefix_tokens], 
+                         device=model.device)
+        ).logits[:, -1, :]
+    
+    # Get candidates that continue from partial token
+    partial = tokenizer.decode(tokens[-rollback_len:])
+    top_tokens = logits.topk(50).indices[0]
+    valid = [
+        t.item() for t in top_tokens
+        if tokenizer.decode([t]).startswith(partial)
+           or partial.startswith(tokenizer.decode([t]))
+    ]
+    
+    if valid:
+        best_token = valid[0]
+        healed_text = prefix_text + tokenizer.decode(
+            [best_token])
+        return healed_text
+    
+    return prompt
+\end{lstlisting}
+
+\subsection{When Token Healing Matters}
+
+\begin{itemize}[itemsep=1pt]
+  \item \textbf{Code completion:} Partial identifiers at prompt boundaries
+  \item \textbf{FIM (Fill-in-the-Middle):} Cursor position splits tokens
+  \item \textbf{Chat continuations:} Resuming from assistant prefill
+  \item \textbf{Guided generation:} Forcing specific token prefixes
+\end{itemize}
+
+%% ============================================================
+\section{RadixAttention \& Prefix Sharing (SGLang) --- Expanded}
+
+Section 49 mentions prefix caching but misses the algorithmic detail. RadixAttention maintains a \textbf{radix tree} of KV cache blocks --- any shared prefix across requests maps to the exact same physical memory pages.
+
+\subsection{Radix Tree KV Cache}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small, caption={Radix Tree KV Cache Example}]
+         "You are a helpful assistant."
+                      |
+          +-----------+-----------+
+          |                       |
+    "Write Python"          "Explain quantum"
+          |                       |
+   +------+------+           "...physics"
+   |             |
+"...code"    "...tests"
+
+Each node = physical KV cache block (shared, read-only)
+New suffix = allocated fresh block
+
+Memory saved = (N_requests - 1) * KV_prefix_size
+For 1000 requests sharing 10K-token prefix:
+  Saved = 999 * 12.5 GB = 12.49 TB of KV cache
+\end{lstlisting}
+
+\subsection{RadixCache Implementation}
+
+\begin{lstlisting}[language=Python, caption={Simplified Radix Tree for KV Cache Sharing}]
+class RadixCache:
+    """Simplified radix tree for KV cache sharing."""
+    
+    def __init__(self, block_size: int = 16):
+        self.block_size = block_size
+        self.root = {
+            "children": {}, "kv_block": None, 
+            "ref_count": 0
+        }
+    
+    def match_prefix(self, token_ids: list):
+        """Find longest matching prefix in the tree."""
+        node = self.root
+        matched = 0
+        
+        for i in range(0, len(token_ids), self.block_size):
+            chunk = tuple(
+                token_ids[i:i + self.block_size])
+            if chunk not in node["children"]:
+                break
+            node = node["children"][chunk]
+            matched += len(chunk)
+        
+        return matched, node
+    
+    def insert(self, token_ids: list, kv_blocks: list):
+        """Insert new sequence, sharing prefix."""
+        matched_len, last_node = self.match_prefix(
+            token_ids)
+        node = last_node
+        
+        # Only insert NEW suffix blocks
+        for i in range(matched_len, len(token_ids), 
+                       self.block_size):
+            chunk = tuple(
+                token_ids[i:i + self.block_size])
+            kv_block = kv_blocks[i // self.block_size]
+            new_node = {
+                "children": {},
+                "kv_block": kv_block,
+                "ref_count": 1
+            }
+            node["children"][chunk] = new_node
+            node = new_node
+        
+        return matched_len  # Tokens saved
+
+    def get_memory_savings(self, n_requests, 
+                           prefix_len, 
+                           kv_bytes_per_token):
+        """Calculate GB saved by prefix sharing."""
+        saved = ((n_requests - 1) * prefix_len 
+                 * kv_bytes_per_token)
+        return saved / 1e9
+\end{lstlisting}
+
+\subsection{RadixAttention vs PagedAttention}
+
+\begin{center}
+\begin{tabular}{lL{5cm}L{5cm}}
+\toprule
+& \textbf{PagedAttention (vLLM)} & \textbf{RadixAttention (SGLang)} \\
+\midrule
+\textbf{Granularity} & Page-level (blocks of tokens) & Prefix-level (radix tree) \\
+\textbf{Sharing} & Copy-on-write for same prefix & Full radix tree deduplication \\
+\textbf{Best for} & General serving & Complex prompting (multi-turn, branching) \\
+\textbf{Overhead} & Page table per request & Radix tree traversal \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{Summary of Advanced Inference Optimizations}
+
+\begin{center}
+\begin{tabular}{L{4cm}llL{4cm}}
+\toprule
+\textbf{Technique} & \textbf{Priority} & \textbf{Complexity} & \textbf{Key Impact} \\
+\midrule
+Multi-Token Prediction & Critical & High & 2--3$\times$ speedup + better training \\
+Fast mode (entropy formula) & Critical & Medium & Cost/latency tradeoff control \\
+EAGLE/EAGLE-2 & High & High & $\sim$3$\times$ speculative decoding \\
+Medusa decoding & High & High & Built-in draft heads, tree verify \\
+Lookahead / Jacobi & High & Medium & No draft model needed \\
+Disaggregated serving & High & High & Optimal HW utilization \\
+CUDA graph capture & High & Medium & 10--20$\times$ at small batch \\
+Token healing & Medium & Low & Better code generation \\
+RadixAttention (SGLang) & Medium & Medium & TB-scale memory savings \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The single most impactful combination is \textbf{fast mode's entropy-based early stopping + MTP architecture}, since those directly affect the cost/latency tradeoff that users care most about when choosing between effort levels.
+
+%% ============================================================
 \section{Sources}
 
 \begin{itemize}
@@ -4438,11 +6172,21 @@ On H100 at 990 TFLOPS (50\% utilization): $\frac{1.5 \times 10^{21}}{990 \times 
   \item Gerganov --- GGUF specification (llama.cpp), 2023
   \item Song et al.\ --- ``PowerInfer: Fast LLM Serving via Locality-Sensitive Computation,'' 2024
   \item Hsieh et al.\ --- ``RULER: What's the Real Context Size of Your LLM?'' 2024
+  \item Li et al.\ --- ``EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty,'' ICML 2024
+  \item Li et al.\ --- ``EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees,'' 2024
+  \item Cai et al.\ --- ``Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads,'' ICML 2024
+  \item Fu et al.\ --- ``Break the Sequential Dependency of LLM Inference Using Lookahead Decoding,'' 2024
+  \item Zhong et al.\ --- ``SGLang: Efficient Execution of Structured Language Model Programs,'' 2024
+  \item DeepSeek-AI --- ``DeepSeek-V3 Technical Report,'' 2024
+  \item NVIDIA --- ``CUDA Graphs Documentation,'' CUDA Toolkit, 2024
+  \item Hewitt et al.\ --- ``Token Healing'' (guidance library), 2023
+  \item Patel et al.\ --- ``Splitwise: Efficient Generative LLM Inference Using Phase Splitting,'' ISCA 2024
+  \item Agrawal et al.\ --- ``Sarathi-Serve: Disaggregated LLM Serving with Chunked-Prefills,'' 2024
 \end{itemize}
 
 \vfill
 \begin{center}
-\textit{Last updated: March 8, 2026}
+\textit{Last updated: March 9, 2026}
 \end{center}
 
 \end{document}
