@@ -1,0 +1,38 @@
+# Claude Opus 4.6 — Model Architecture & Training Code
+# =====================================================
+
+# Core PyTorch
+torch>=2.3.0
+torchvision>=0.18.0
+torchaudio>=2.3.0
+
+# Model serialization
+safetensors>=0.4.0
+
+# Tokenizer
+sentencepiece>=0.2.0
+tokenizers>=0.19.0
+transformers>=4.41.0
+
+# Training utilities
+accelerate>=0.30.0
+datasets>=2.19.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Logging & experiment tracking
+wandb>=0.17.0
+tensorboard>=2.16.0
+
+# Data processing
+zstandard>=0.22.0
+xxhash>=3.4.0
+
+# Numerical computing
+numpy>=1.26.0
+scipy>=1.13.0
+
+# GGUF support (optional)
+# gguf>=0.6.0

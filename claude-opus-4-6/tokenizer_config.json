@@ -1,0 +1,12 @@
+{
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|end_of_text|>",
+    "pad_token": "<|pad|>",
+    "unk_token": "<unk>",
+    "model_max_length": 1048576,
+    "tokenizer_class": "PreTrainedTokenizerFast",
+    "add_bos_token": true,
+    "add_eos_token": false,
+    "clean_up_tokenization_spaces": false,
+    "chat_template": "{% for message in messages %}{% if message['role'] == 'system' %}<|start_header|>system<|end_header|>\n{{ message['content'] }}<|eot_id|>{% elif message['role'] == 'user' %}<|start_header|>user<|end_header|>\n{{ message['content'] }}<|eot_id|>{% elif message['role'] == 'assistant' %}<|start_header|>assistant<|end_header|>\n{{ message['content'] }}<|eot_id|>{% endif %}{% endfor %}<|start_header|>assistant<|end_header|>\n"
+}

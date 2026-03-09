@@ -1,0 +1,56 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Checkpoints and model weights
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+
+# Logs
+logs/
+wandb/
+runs/
+*.log
+
+# Data
+data/
+*.jsonl
+*.parquet
+*.arrow
+*.zst
+
+# Tokenizer artifacts (large binaries)
+tokenizer.model
+tokenizer.json
+
+# Jupyter
+.ipynb_checkpoints/

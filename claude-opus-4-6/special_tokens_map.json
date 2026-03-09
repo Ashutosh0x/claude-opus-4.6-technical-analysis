@@ -1,0 +1,20 @@
+{
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|end_of_text|>",
+    "pad_token": "<|pad|>",
+    "additional_special_tokens": [
+        "<|start_header|>",
+        "<|end_header|>",
+        "<|eot_id|>",
+        "<tool_call>",
+        "</tool_call>",
+        "<tool_result>",
+        "</tool_result>",
+        "<thinking>",
+        "</thinking>",
+        "<|image|>",
+        "<|fim_prefix|>",
+        "<|fim_middle|>",
+        "<|fim_suffix|>"
+    ]
+}
